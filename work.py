@@ -114,9 +114,9 @@ def run(source, args):
             depth.close()
 
 
-def process(source, camera, detector, tracker, depth, depth_hz, output):
+def process(source, camera, detector, tracker, depth, depth_hz, output, on_crossing=None):
     states = {}
-    source_segment = previous = last_sample = last_frame_at = previous_shape = None
+    source_segment = previous = last_frame_at = previous_shape = None
     segment = frames = 0
     fps = 0.0
     depth_fresh_s = max(0.50, 2 / depth_hz)
@@ -136,7 +136,6 @@ def process(source, camera, detector, tracker, depth, depth_hz, output):
             if depth is not None:
                 depth.reset()
             segment += 1
-            last_sample = None
             source_segment = frame.segment
         previous = time_s
         previous_shape = shape
@@ -165,25 +164,21 @@ def process(source, camera, detector, tracker, depth, depth_hz, output):
             distance = state.distance.meters if time_s - state.distance.time_s <= depth_fresh_s else None
             vehicles.append(VehicleInfo(track, lane, speed, distance))
             crossing = camera.flow.observe(state.flow, pixel, time_s, track.id, track.label)
-            if crossing is not None:
-                output.crossing(segment, crossing)
+            if crossing is not None and on_crossing is not None:
+                on_crossing(crossing)
         density = lane_density(camera.lane_map.lanes, (v.lane for v in vehicles))
         flows = camera.flow.snapshot(time_s)
-        if last_sample is None or time_s - last_sample >= 1 - 1e-6:
-            output.sample(segment, time_s, vehicles, density, flows)
-            last_sample = time_s
+        visible = output.observe(segment, time_s, vehicles, active)
         now = monotonic()
         if last_frame_at is not None:
             fps_now = 1 / max(now - last_frame_at, 1e-6)
             fps = fps_now if fps == 0 else 0.15 * fps_now + 0.85 * fps
         last_frame_at = now
         frames += 1
-        if output.show(frame.image, scale, vehicles, density, flows, fps, (now - frame.received_at) * 1000):
+        if output.show(frame.image, scale, visible, density, flows, fps, (now - frame.received_at) * 1000):
             break
     if frames == 0:
         raise ValueError("No video frame was processed.")
-    if previous - last_sample > 1e-6:
-        output.sample(segment, previous, vehicles, density, flows)
     elapsed = monotonic() - started
     logging.info("Processed %d frames in %.1f s (%.1f FPS).", frames, elapsed, frames / max(elapsed, 1e-6))
 

@@ -16,7 +16,7 @@ from tempfile import TemporaryDirectory
 import av
 import cv2
 
-from output import Output
+from output import CSV_COLUMNS, Output
 from tracking import VehicleTracker
 from vehicle_detection import VehicleDetector
 from video import VideoSource
@@ -150,30 +150,32 @@ class RecordedOutput(Output):
         Output._text(image, label, point, scale)
 
 
-def verify(clip, output, tracker):
+def verify(clip, output, tracker, events):
     with av.open(str(output.video_path)) as movie:
         stream = movie.streams.video[0]
         if (clip.frame_count != FPS * SECONDS or stream.frames != clip.frame_count
                 or stream.average_rate != FPS or stream.duration * stream.time_base != SECONDS):
             raise ValueError("The test requires an uninterrupted two-minute clip (2,400 frames).")
-    with output.path.open(encoding="utf-8", newline="") as csv_file:
-        rows = list(csv.DictReader(csv_file))
-    if not rows or max(float(row["video_s"]) for row in rows) != SECONDS - 1 / FPS:
-        raise ValueError("CSV does not cover the complete test clip.")
-    samples = {int(row["track_id"]) for row in rows if row["record_type"] == "vehicle"}
+    with output.path.open(encoding="utf-8-sig", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        rows = list(reader)
+        if reader.fieldnames != list(CSV_COLUMNS):
+            raise ValueError("CSV does not have the expected vehicle columns.")
+    sequential_ids = list(range(1, len(output.records) + 1))
+    if [int(row[CSV_COLUMNS[1]]) for row in rows] != sequential_ids:
+        raise ValueError("CSV must have one row per exported vehicle and consecutive IDs.")
+    samples = {record.vehicle.track.id for record in output.records}
     confirmed = tracker.observations.keys()
     if not samples <= confirmed <= tracker.allocated:
         raise ValueError("The exported track IDs do not agree with the tracker observations.")
-    events = [row for row in rows if row["record_type"] == "crossing"]
     stable = 0
     for event in events:
-        time_s = float(event["video_s"])
-        nearby = range(max(0, ceil((time_s - 0.5) * FPS)),
-                       min(clip.frame_count, floor((time_s + 0.5) * FPS) + 1))
-        stable += set(nearby) <= tracker.observations[int(event["track_id"])]
-    print("Crossings by lane:", dict(sorted(Counter(row["lane"] for row in events).items())))
+        nearby = range(max(0, ceil((event.time_s - 0.5) * FPS)),
+                       min(clip.frame_count, floor((event.time_s + 0.5) * FPS) + 1))
+        stable += set(nearby) <= tracker.observations[event.track_id]
+    print("Crossings by lane:", dict(sorted(Counter(event.lane for event in events).items())))
     print(f"Track IDs: {len(tracker.allocated)} allocated, {len(confirmed)} output frame by frame, "
-          f"{len(samples)} in the one-second CSV samples.")
+          f"{len(rows)} exported vehicle rows.")
     print(f"Continuous same ID within 0.5 s of the line: {stable}/{len(events)} crossings.")
 
 
@@ -198,10 +200,11 @@ def main():
         config = scratch / "camera.json"
         config.write_text(json.dumps(point1_calibration()), encoding="utf-8")
         camera = Camera(config)
+        events = []
         with RecordedOutput(scratch / "results", camera) as output, clip:
-            process(clip, camera, detector, tracker, None, 5.0, output)
+            process(clip, camera, detector, tracker, None, 5.0, output, on_crossing=events.append)
             output.finish()
-        verify(clip, output, tracker)
+        verify(clip, output, tracker, events)
         run_dir = args.output / output.path.stem.replace("traffic_results_", "point1_test_", 1)
         output.path.parent.rename(run_dir)
     print("CSV:", (run_dir / output.path.name).resolve())

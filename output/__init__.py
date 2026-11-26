@@ -1,8 +1,8 @@
-"""Desktop overlays and streaming CSV export."""
+"""Desktop overlays and per-vehicle CSV export."""
 
 import csv
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -11,11 +11,9 @@ import numpy as np
 
 
 CSV_COLUMNS = (
-    "segment", "video_s", "record_type", "track_id", "vehicle_class", "lane",
-    "speed_kmh", "density_veh_per_km_per_lane", "vehicles_in_zone",
-    "crossings_total", "crossings_in_window", "flow_veh_per_hour", "flow_window_s",
-    "distance_m", "distance_type", "confidence", "x1", "y1", "x2", "y2",
+    "时间帧", "车辆ID", "车辆类型", "所在车道", "速度（km/h）", "置信度", "位置坐标",
 )
+VEHICLE_NAMES = {"car": "小汽车", "motorcycle": "摩托车", "bus": "客车", "truck": "货车"}
 
 
 @dataclass(frozen=True)
@@ -26,8 +24,32 @@ class VehicleInfo:
     distance: float | None
 
 
-def number(value, digits=2):
-    return "" if value is None else round(value, digits)
+def video_time(time_s):
+    seconds, milliseconds = divmod(round(time_s * 1000), 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+
+@dataclass(frozen=True)
+class VehicleObservation:
+    time_s: float
+    vehicle: VehicleInfo
+
+    @property
+    def quality(self):
+        has_speed = self.vehicle.speed is not None
+        has_lane = self.vehicle.lane is not None
+        return has_speed + has_lane, has_speed, self.vehicle.track.confidence
+
+    def csv_row(self, vehicle_id):
+        track = self.vehicle.track
+        box = ", ".join(f"{coordinate:.1f}" for coordinate in track.box)
+        return (
+            video_time(self.time_s), vehicle_id, VEHICLE_NAMES.get(track.label, track.label),
+            self.vehicle.lane, None if self.vehicle.speed is None else round(self.vehicle.speed, 2),
+            round(track.confidence, 3), f"({box})",
+        )
 
 
 class Output:
@@ -42,61 +64,61 @@ class Output:
         self.window = "Highway traffic"
         self.window_open = False
         self.geometry = None
+        self.records = []
+        self.vehicle_ids = {}
+        self.candidates = {}
+        self.segment = None
+        self.time_offset = self.last_time_s = 0.0
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self.stream = self.stack.enter_context(self.path.open("x", encoding="utf-8", newline=""))
-            self.writer = csv.DictWriter(self.stream, fieldnames=CSV_COLUMNS)
-            self.writer.writeheader()
-            self.stream.flush()
+            stream = self.stack.enter_context(self.path.open("x", encoding="utf-8-sig", newline=""))
+            self.writer = csv.writer(stream)
+            self.writer.writerow(CSV_COLUMNS)
+            stream.flush()
         except BaseException:
             self.stack.close()
             raise
         return self
 
     def __exit__(self, *_):
-        self.stack.close()
-        if self.window_open:
-            cv2.destroyAllWindows()
+        try:
+            self.writer.writerows(record.csv_row(vehicle_id) for vehicle_id, record in enumerate(self.records, 1))
+        finally:
+            self.stack.close()
+            if self.window_open:
+                cv2.destroyAllWindows()
 
-    def crossing(self, segment, event):
-        self.writer.writerow({
-            "segment": segment, "video_s": number(event.time_s, 3), "record_type": "crossing",
-            "track_id": event.track_id, "vehicle_class": event.label, "lane": event.lane,
-        })
-        self.stream.flush()
+    def observe(self, segment, time_s, vehicles, active_ids):
+        """Confirm exports across two consecutive frames and keep one observation per ID."""
+        if segment != self.segment:
+            self.time_offset = max(self.time_offset, self.last_time_s - time_s)
+            self.segment = segment
+            self.vehicle_ids.clear()
+            self.candidates.clear()
+        self.last_time_s = time_s + self.time_offset
+        for raw_id in self.vehicle_ids.keys() - active_ids:
+            del self.vehicle_ids[raw_id]
 
-    def sample(self, segment, time_s, vehicles, density, flows):
-        common = {"segment": segment, "video_s": number(time_s, 3)}
-        lane_stats = {}
-        for lane, (count, k) in density.items():
-            stats = {"vehicles_in_zone": count, "density_veh_per_km_per_lane": number(k)}
-            if lane in flows:
-                total, recent, rate = flows[lane]
-                stats.update(
-                    crossings_total=total, crossings_in_window=recent,
-                    flow_veh_per_hour=rate, flow_window_s=self.window_s,
-                )
-            lane_stats[lane] = stats
-
-        occupied = set()
-        for vehicle in vehicles:
-            track = vehicle.track
-            x1, y1, x2, y2 = (round(float(coordinate), 1) for coordinate in track.box)
-            self.writer.writerow({
-                **common, "record_type": "vehicle", "track_id": track.id, "vehicle_class": track.label,
-                "lane": vehicle.lane, "speed_kmh": number(vehicle.speed),
-                "distance_m": number(vehicle.distance),
-                "distance_type": self.distance_type if vehicle.distance is not None else "",
-                "confidence": number(track.confidence, 3), "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                **lane_stats.get(vehicle.lane, {}),
-            })
-            occupied.add(vehicle.lane)
-        for lane, stats in lane_stats.items():
-            if lane not in occupied:
-                self.writer.writerow({**common, "record_type": "lane", "lane": lane, **stats})
-        self.stream.flush()
+        candidates, visible = {}, []
+        measured = {vehicle.track.id: vehicle for vehicle in vehicles}
+        # Use the prior frame's order to break ties between simultaneous appearances.
+        for raw_id, first in self.candidates.items():
+            if raw_id in measured:
+                self.vehicle_ids[raw_id] = len(self.records) + 1
+                self.records.append(first)
+        for raw_id, vehicle in measured.items():
+            observation = VehicleObservation(self.last_time_s, vehicle)
+            vehicle_id = self.vehicle_ids.get(raw_id)
+            if vehicle_id is None:
+                candidates[raw_id] = observation
+                continue
+            if observation.quality > self.records[vehicle_id - 1].quality:
+                self.records[vehicle_id - 1] = observation
+            visible.append(replace(vehicle, track=replace(vehicle.track, id=vehicle_id)))
+        self.candidates = candidates
+        return visible
 
     def show(self, frame, scale, vehicles, density, flows, fps, frame_age_ms):
         if not self.preview:
