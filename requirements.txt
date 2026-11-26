@@ -1,0 +1,8 @@
+av==16.1.0
+lap==0.5.12
+numpy>=2.0,<2.3
+opencv-python>=4.10,<5
+torch>=2.7,<3
+torchvision>=0.22,<1
+transformers==4.57.6
+ultralytics==8.4.45
